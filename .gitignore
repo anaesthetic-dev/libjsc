@@ -1,0 +1,8 @@
+/webkit/
+/build/
+/dist/
+/vcpkg_installed/
+/consumer/
+/llvm.sh
+/.cache/
+__pycache__/

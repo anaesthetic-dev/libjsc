@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.24)
+project(jsc_example LANGUAGES CXX)
+find_package(JavaScriptCore CONFIG REQUIRED)
+add_executable(jsc-example main.cpp)
+target_link_libraries(jsc-example PRIVATE JavaScriptCore::JavaScriptCore)
+if(MSVC)
+    set_property(TARGET jsc-example PROPERTY MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
+endif()

@@ -1,0 +1,157 @@
+name: Build JavaScriptCore SDK
+
+on:
+  workflow_dispatch:
+    inputs:
+      webkit_ref:
+        description: 'Optional oven-sh/WebKit revision; leave empty to use webkit-ref.txt'
+        required: false
+        type: string
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: resolve
+        name: Resolve one WebKit revision for both platforms
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEBKIT_REF: ${{ inputs.webkit_ref }}
+        shell: bash
+        run: |
+          ref="${WEBKIT_REF:-$(cat webkit-ref.txt)}"
+          sha=$(gh api "repos/oven-sh/WebKit/commits/$ref" --jq .sha)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "WebKit: $sha" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            platform: windows-x64-md
+          - os: ubuntu-24.04
+            platform: linux-x64-ubuntu24.04
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preserve LF in WebKit sources
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+      - name: Fetch WebKit
+        uses: actions/checkout@v4
+        with:
+          repository: oven-sh/WebKit
+          ref: ${{ needs.source.outputs.sha }}
+          path: webkit
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ruby perl bison gperf libicu-dev libxml2-dev lld
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21
+          sudo apt-get install -y lld-21
+          sudo ln -sf /usr/bin/ld.lld-21 /usr/bin/ld.lld
+      - name: Windows compiler environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Windows LLVM
+        if: runner.os == 'Windows'
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: '21.1.8'
+      - name: Prepare vcpkg binary cache
+        id: vcpkg-version
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $revision = git -C "$env:VCPKG_INSTALLATION_ROOT" rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "revision=$revision" >> $env:GITHUB_OUTPUT
+          $cache = "$env:GITHUB_WORKSPACE/.cache/vcpkg"
+          New-Item -ItemType Directory -Force $cache | Out-Null
+          "VCPKG_DEFAULT_BINARY_CACHE=$cache" >> $env:GITHUB_ENV
+      - name: Restore ICU binary cache
+        id: icu-cache
+        if: runner.os == 'Windows'
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/vcpkg
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg-version.outputs.revision }}-${{ hashFiles('triplets/*.cmake') }}
+      - name: Build Windows ICU (/MD, Release only)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install icu:x64-windows --overlay-triplets="$env:GITHUB_WORKSPACE/triplets" --disable-metrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "ICU_ROOT=$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows" >> $env:GITHUB_ENV
+      - name: Save ICU binary cache before building JavaScriptCore
+        if: runner.os == 'Windows' && steps.icu-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/vcpkg
+          key: ${{ steps.icu-cache.outputs.cache-primary-key }}
+      - name: Build and package SDK
+        run: python scripts/build.py --source webkit --platform ${{ matrix.platform }} --jobs 2
+      - name: Build SDK consumer
+        shell: bash
+        run: |
+          sdk="$GITHUB_WORKSPACE/dist/javascriptcore-${{ matrix.platform }}"
+          cmake -S "$sdk/examples" -B consumer -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$sdk"
+          cmake --build consumer
+      - name: Run example (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:GITHUB_WORKSPACE/dist/javascriptcore-${{ matrix.platform }}/bin;$env:PATH"
+          & ./consumer/jsc-example.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run example (Linux)
+        if: runner.os == 'Linux'
+        run: ./consumer/jsc-example
+      - uses: actions/upload-artifact@v4
+        with:
+          name: javascriptcore-${{ matrix.platform }}
+          path: |
+            dist/*.zip*
+            dist/*.tar.gz*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: javascriptcore-*
+          merge-multiple: true
+          path: dist
+      - name: Publish SDKs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes
