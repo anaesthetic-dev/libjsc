@@ -8,6 +8,7 @@ on:
         required: false
         type: string
   push:
+    branches: [main]
     tags: ['v*']
 
 permissions:
@@ -138,20 +139,67 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-24.04
+    concurrency:
+      group: sdk-release
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           pattern: javascriptcore-*
           merge-multiple: true
           path: dist
+      - name: Select release version
+        id: version
+        shell: bash
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+          stable_tag='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            tag="$GITHUB_REF_NAME"
+            [[ "$tag" =~ $stable_tag ]] || { echo "Expected vMAJOR.MINOR.PATCH" >&2; exit 1; }
+          else
+            tag=$(git tag --points-at "$RELEASE_COMMIT" | sed -nE "/$stable_tag/p" | sort -V | tail -n 1)
+            if [[ -z "$tag" ]]; then
+              latest=$(git tag --list 'v*' | sed -nE "/$stable_tag/p" | sort -V | tail -n 1)
+              if [[ -z "$latest" ]]; then
+                tag=v1.0.0
+              else
+                IFS=. read -r major minor patch <<< "${latest#v}"
+                tag="v$major.$minor.$((patch + 1))"
+              fi
+            fi
+          fi
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            [[ "$(git rev-parse "$tag^{commit}")" == "$RELEASE_COMMIT" ]] || {
+              echo "$tag identifies a different SDK build commit" >&2; exit 1;
+            }
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Release: $tag (commit $RELEASE_COMMIT)"
       - name: Publish SDKs
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A rerun may find a draft or a release created before assets uploaded.
+          # Create its tag at the exact SDK build commit, never the moving main.
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" --draft --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false
+          echo "Published $RELEASE_TAG from $RELEASE_COMMIT" >> "$GITHUB_STEP_SUMMARY"

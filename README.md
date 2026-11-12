@@ -57,7 +57,7 @@ int main() {
 
 ## Building
 
-- **GitHub Actions:** Run **Actions → Build JavaScriptCore SDK → Run workflow**, or push a `v*` tag to automatically build and publish a GitHub Release.
+- **GitHub Actions:** Push to `main`, or run **Actions → Build JavaScriptCore SDK → Run workflow**. After both platforms build successfully, the workflow creates the next patch version (`v1.0.1` → `v1.0.2`), its tag, and the release automatically. No manual tag or release is needed. Existing stable tags for the same commit are reused; reruns upload assets with replacement instead of failing when a release already exists. Manual `vMAJOR.MINOR.PATCH` tags remain supported.
 - **Pinned Revision:** `webkit-ref.txt` pins the exact `oven-sh/WebKit` commit used across both platforms.
 - **Local Build:**
   ```sh
