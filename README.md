@@ -4,7 +4,7 @@ Prebuilt **JavaScriptCore** C-API shared library SDK for **Windows x64** and **L
 
 ## Features
 
-- **Official C-API (`<JavaScriptCore/JavaScript.h>`):** Exports the 117 public C-API symbols (`JSGlobalContextCreate`, `JSEvaluateScript`, `JSObjectGetTypedArrayBytesPtr`, etc.).
+- **Official C-API (`<JavaScriptCore/JavaScript.h>`):** Exports public C-API functions (`JSGlobalContextCreate`, `JSEvaluateScript`, `JSObjectGetTypedArrayBytesPtr`, etc.) and data such as `kJSClassDefinitionEmpty`. Windows data exports are marked `DATA` in the module definition file.
 - **Windows x64 (`windows-x64-md`):**
   - `bin/JavaScriptCore.dll` + `lib/JavaScriptCore.lib` (import library)
   - Compiled with `clang-cl` and **Dynamic CRT (`/MD`)** (`MultiThreadedDLL`)

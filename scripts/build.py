@@ -1,5 +1,6 @@
 """Build the JSCOnly shared C API and assemble a development SDK."""
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -57,23 +58,37 @@ def run(*args):
     subprocess.run([str(arg) for arg in args], check=True)
 
 
-def extract_c_api_exports(api_dir: Path) -> list[str]:
+@dataclass(frozen=True, order=True)
+class ApiExport:
+    name: str
+    is_data: bool = False
+
+
+def extract_c_api_exports(api_dir: Path) -> list[ApiExport]:
+    """Collect public functions and extern data, preserving their export kind."""
     comment_re = re.compile(r'/\*.*?\*/|//[^\n]*', re.DOTALL)
-    export_re = re.compile(
+    function_re = re.compile(
         r'JS_EXPORT\s+(?:(?!;).)*?\b(JS[A-Z][A-Za-z0-9_]*)\s*\(',
         re.DOTALL,
     )
-    names = set()
+    # Public data declarations do not have a function parameter list and need
+    # not start with JS (notably kJSClassDefinitionEmpty in JSObjectRef.h).
+    data_re = re.compile(
+        r'JS_EXPORT\s+extern\s+[^;()]+?\b([A-Za-z_][A-Za-z0-9_]*)\s*;',
+    )
+    exports = set()
     for name in PUBLIC_API_HEADERS:
         header = api_dir / name
         if not header.is_file():
             continue
         text = comment_re.sub('', header.read_text(encoding='utf-8', errors='replace'))
-        for match in export_re.finditer(text):
-            names.add(match.group(1))
-    if not names:
+        for match in function_re.finditer(text):
+            exports.add(ApiExport(match.group(1)))
+        for match in data_re.finditer(text):
+            exports.add(ApiExport(match.group(1), is_data=True))
+    if not exports:
         raise RuntimeError('No JS_EXPORT symbols found in API headers')
-    return sorted(names)
+    return sorted(exports)
 
 
 def patch_js_global_context_release(source: Path) -> None:
@@ -137,7 +152,7 @@ def link_shared_library(
     build: Path,
     sdk: Path,
     icu: Path | None,
-    exports: list[str],
+    exports: list[ApiExport],
     jobs: int,
 ) -> None:
     shim_c = build / 'shim.c'
@@ -148,7 +163,12 @@ def link_shared_library(
         run('clang-cl', '/MD', '/O2', '/c', shim_c, f'/Fo{shim_obj}')
 
         def_file = build / 'JavaScriptCore.def'
-        def_lines = ['LIBRARY JavaScriptCore', 'EXPORTS'] + [f'    {s}' for s in exports]
+        # DATA is required for the import library to describe variables rather
+        # than generate function thunks for them.
+        def_lines = ['LIBRARY JavaScriptCore', 'EXPORTS'] + [
+            f'    {symbol.name}' + (' DATA' if symbol.is_data else '')
+            for symbol in exports
+        ]
         def_file.write_text('\n'.join(def_lines) + '\n', encoding='ascii')
 
         mimalloc_lib = ensure_windows_mimalloc(source, build, jobs)
@@ -190,7 +210,7 @@ def link_shared_library(
         run('clang-21', '-fPIC', '-O2', '-c', shim_c, '-o', shim_o)
 
         ver_file = build / 'JavaScriptCore.map'
-        ver_lines = ['{', '  global:'] + [f'    {s};' for s in exports] + ['  local:', '    *;', '};']
+        ver_lines = ['{', '  global:'] + [f'    {symbol.name};' for symbol in exports] + ['  local:', '    *;', '};']
         ver_file.write_text('\n'.join(ver_lines) + '\n', encoding='ascii')
 
         lib_dir = build / 'lib'
@@ -207,7 +227,7 @@ def link_shared_library(
                 static_libs[i] = found[0]
 
         so_out = sdk / 'lib/libJavaScriptCore.so'
-        u_flags = [f'-Wl,-u,{s}' for s in exports]
+        u_flags = [f'-Wl,-u,{symbol.name}' for symbol in exports]
         run(
             'clang++-21', '-shared', '-fuse-ld=lld',
             '-o', so_out,
