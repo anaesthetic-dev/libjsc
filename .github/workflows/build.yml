@@ -65,12 +65,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build ruby perl bison gperf libicu-dev libxml2-dev lld
+          sudo apt-get install -y ninja-build ruby perl bison gperf libicu-dev libxml2-dev
           wget -q https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh 21
-          sudo apt-get install -y lld-21
-          sudo ln -sf /usr/bin/ld.lld-21 /usr/bin/ld.lld
+          sudo apt-get install -y lld-21 llvm-21
       - name: Windows compiler environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -80,7 +79,8 @@ jobs:
         if: runner.os == 'Windows'
         uses: KyleMayes/install-llvm-action@v2
         with:
-          version: '21.1.8'
+          version: '22.1.8'
+          force-url: https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-win64.exe
       - name: Prepare vcpkg binary cache
         id: vcpkg-version
         if: runner.os == 'Windows'
@@ -98,21 +98,24 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .cache/vcpkg
-          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg-version.outputs.revision }}-${{ hashFiles('triplets/*.cmake') }}
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg-version.outputs.revision }}-${{ hashFiles('triplets/*.cmake', 'icu/**', 'scripts/prepare_icu_overlay.py') }}
       - name: Build Windows ICU (/MD, Release only)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install icu:x64-windows --overlay-triplets="$env:GITHUB_WORKSPACE/triplets" --disable-metrics
+          python scripts/prepare_icu_overlay.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          "ICU_ROOT=$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows" >> $env:GITHUB_ENV
+          $installed = "$env:GITHUB_WORKSPACE/vcpkg_installed"
+          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install icu:x64-windows --classic --host-triplet=x64-windows --x-install-root="$installed" --overlay-triplets="$env:GITHUB_WORKSPACE/triplets" --overlay-ports="$env:GITHUB_WORKSPACE/build/overlay-ports" --disable-metrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "ICU_ROOT=$installed/x64-windows" >> $env:GITHUB_ENV
       - name: Save ICU binary cache before building JavaScriptCore
         if: runner.os == 'Windows' && steps.icu-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: .cache/vcpkg
           key: ${{ steps.icu-cache.outputs.cache-primary-key }}
-      - name: Build and package SDK
+      - name: Build, check binary size, and package SDK
         run: python scripts/build.py --source webkit --platform ${{ matrix.platform }} --jobs 2
       - name: Build SDK consumer
         shell: bash
@@ -120,15 +123,19 @@ jobs:
           sdk="$GITHUB_WORKSPACE/dist/javascriptcore-${{ matrix.platform }}"
           cmake -S "$sdk/examples" -B consumer -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$sdk"
           cmake --build consumer
-      - name: Run example (Windows)
+      - name: Run SDK smoke test (Windows)
         if: runner.os == 'Windows'
+        env:
+          JSC_useConcurrentJIT: 'false'
         shell: pwsh
         run: |
           $env:PATH = "$env:GITHUB_WORKSPACE/dist/javascriptcore-${{ matrix.platform }}/bin;$env:PATH"
           & ./consumer/jsc-example.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Run example (Linux)
+      - name: Run SDK smoke test (Linux)
         if: runner.os == 'Linux'
+        env:
+          JSC_useConcurrentJIT: 'false'
         run: ./consumer/jsc-example
       - uses: actions/upload-artifact@v4
         with:

@@ -11,6 +11,11 @@ import shutil
 import subprocess
 import tarfile
 
+from check_size import check_size
+
+
+WINDOWS_SIZE_FLAGS = ('/O1', '/Os', '/Gy', '/Gw', '-flto=thin')
+LINUX_SIZE_FLAGS = ('-Os', '-ffunction-sections', '-fdata-sections', '-flto=thin')
 
 PUBLIC_API_HEADERS = (
     'JavaScript.h',
@@ -121,10 +126,45 @@ def neutralize_windows_declspec_in_internal_macros(source: Path) -> None:
     export_macros.write_text(text, encoding='utf-8')
 
 
+def disable_extractor_lto(source: Path, windows: bool) -> None:
+    """Offlineasm reads the native executables to recover its settings and offsets."""
+    path = source / 'Source/JavaScriptCore/CMakeLists.txt'
+    original = path.read_text(encoding='utf-8')
+    patched = original
+    flag = '/clang:-fno-lto' if windows else '-fno-lto'
+    for target in ('LLIntSettingsExtractor', 'LLIntOffsetsExtractor'):
+        anchor = f'WEBKIT_EXECUTABLE({target})'
+        marker = f'\n# Keep {target} out of ThinLTO for offlineasm.'
+        config = f'{marker}\ntarget_compile_options({target} PRIVATE {flag})'
+        if patched.count(anchor) != 1:
+            raise RuntimeError(f'Cannot find the unique WebKit target for {target}')
+        patched = re.sub(re.escape(marker) + r'\ntarget_compile_options\([^\n]*\)', '', patched)
+        patched = patched.replace(anchor, anchor + config, 1)
+    if patched != original:
+        path.write_text(patched, encoding='utf-8', newline='\n')
+
+
+def release_flags(compile_options: tuple[str, ...]) -> list[str]:
+    options = ' '.join((*compile_options, '-DNDEBUG'))
+    return [f'-DCMAKE_{language}_FLAGS_RELEASE={options}' for language in ('C', 'CXX')]
+
+
+def llvm_tool_flags(windows: bool) -> list[str]:
+    if windows:
+        tools = (('LINKER', 'lld-link'), ('AR', 'llvm-lib'))
+    else:
+        tools = (('AR', 'llvm-ar-21'), ('RANLIB', 'llvm-ranlib-21'))
+    flags = []
+    for variable, name in tools:
+        executable = shutil.which(name)
+        if not executable:
+            raise RuntimeError(f'ThinLTO requires {name} on PATH')
+        # Keep the invoked name because llvm-ranlib can be a symlink to llvm-ar.
+        flags.append(f'-DCMAKE_{variable}={Path(executable).absolute().as_posix()}')
+    return flags
+
+
 def ensure_windows_mimalloc(source: Path, build: Path, jobs: int) -> Path:
-    existing = list(build.rglob('mimalloc*.lib'))
-    if existing:
-        return existing[0]
     mi_src = source / 'Source/bmalloc/mimalloc/mimalloc'
     mi_build = build / 'mimalloc-md'
     run(
@@ -133,6 +173,8 @@ def ensure_windows_mimalloc(source: Path, build: Path, jobs: int) -> Path:
         '-DCMAKE_C_COMPILER=clang-cl',
         '-DCMAKE_CXX_COMPILER=clang-cl',
         '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL',
+        *llvm_tool_flags(windows=True),
+        *release_flags(WINDOWS_SIZE_FLAGS),
         '-DMI_OVERRIDE=OFF',
         '-DMI_BUILD_SHARED=OFF',
         '-DMI_BUILD_STATIC=ON',
@@ -154,13 +196,13 @@ def link_shared_library(
     icu: Path | None,
     exports: list[ApiExport],
     jobs: int,
-) -> None:
+) -> Path:
     shim_c = build / 'shim.c'
     shim_c.write_text(SHIM_C_SOURCE, encoding='utf-8')
 
     if windows:
         shim_obj = build / 'shim.obj'
-        run('clang-cl', '/MD', '/O2', '/c', shim_c, f'/Fo{shim_obj}')
+        run('clang-cl', '/MD', '/DNDEBUG', *WINDOWS_SIZE_FLAGS, '/c', shim_c, f'/Fo{shim_obj}')
 
         def_file = build / 'JavaScriptCore.def'
         # DATA is required for the import library to describe variables rather
@@ -186,9 +228,13 @@ def link_shared_library(
                     raise RuntimeError(f'Missing static library: {lib.name}')
                 static_libs[i] = found[0]
 
-        icu_libs = sorted((icu / 'lib').glob('icu*.lib'))
-        if not icu_libs:
-            raise RuntimeError(f'No ICU .lib files found in {icu / "lib"}')
+        icu_libs = []
+        for name in ('icuin.lib', 'icuuc.lib', 'icudt.lib'):
+            candidates = [icu / 'lib' / filename for filename in (name, f's{name}')]
+            library = next((path for path in candidates if path.is_file()), None)
+            if library is None:
+                raise RuntimeError(f'Missing {name} or s{name} in {icu / "lib"}')
+            icu_libs.append(library)
 
         dll_out = sdk / 'bin/JavaScriptCore.dll'
         imp_out = sdk / 'lib/JavaScriptCore.lib'
@@ -203,11 +249,13 @@ def link_shared_library(
             f'/OUT:{dll_out}',
             f'/IMPLIB:{imp_out}',
             '/MACHINE:X64', '/NOLOGO', '/INCREMENTAL:NO', '/OPT:REF', '/OPT:ICF',
+            '/OPT:LLDLTOJOBS=2',
             shim_obj, *static_libs, *icu_libs, *sys_libs,
         )
+        return dll_out
     else:
         shim_o = build / 'shim.o'
-        run('clang-21', '-fPIC', '-O2', '-c', shim_c, '-o', shim_o)
+        run('clang-21', '-fPIC', '-DNDEBUG', *LINUX_SIZE_FLAGS, '-c', shim_c, '-o', shim_o)
 
         ver_file = build / 'JavaScriptCore.map'
         ver_lines = ['{', '  global:'] + [f'    {symbol.name};' for symbol in exports] + ['  local:', '    *;', '};']
@@ -229,11 +277,11 @@ def link_shared_library(
         so_out = sdk / 'lib/libJavaScriptCore.so'
         u_flags = [f'-Wl,-u,{symbol.name}' for symbol in exports]
         run(
-            'clang++-21', '-shared', '-fuse-ld=lld',
+            'clang++-21', '-shared', '-fuse-ld=lld-21', '-Os', '-flto=thin',
             '-o', so_out,
             f'-Wl,--version-script={ver_file}',
             '-Wl,-soname,libJavaScriptCore.so',
-            '-Wl,--gc-sections',
+            '-Wl,--gc-sections', '-Wl,--icf=safe', '-Wl,--thinlto-jobs=2', '-Wl,-s',
             *u_flags,
             '-Wl,--start-group',
             shim_o, *static_libs,
@@ -241,6 +289,7 @@ def link_shared_library(
             '-licui18n', '-licuuc', '-licudata',
             '-lpthread', '-ldl', '-lm', '-latomic', '-lstdc++', '-lgcc_s',
         )
+        return so_out
 
 
 def main():
@@ -269,6 +318,7 @@ def main():
                            'git -c core.autocrlf=false clone https://github.com/oven-sh/WebKit.git webkit')
 
     patch_js_global_context_release(source)
+    disable_extractor_lto(source, windows)
 
     if windows:
         neutralize_windows_declspec_in_internal_macros(source)
@@ -284,12 +334,14 @@ def main():
         '-DCMAKE_BUILD_TYPE=Release',
         '-DENABLE_STATIC_JSC=ON',
         '-DENABLE_FTL_JIT=ON',
+        '-DENABLE_WEBASSEMBLY=ON',
         '-DUSE_BUN_JSC_ADDITIONS=ON',
         '-DUSE_BUN_EVENT_LOOP=ON',
         '-DENABLE_REMOTE_INSPECTOR=OFF',
         '-DENABLE_JSC_GLIB_API=OFF',
         '-DENABLE_API_TESTS=OFF',
         '-DCMAKE_POSITION_INDEPENDENT_CODE=ON',
+        # The SDK controls ThinLTO flags and excludes the offlineasm tools.
         '-DENABLE_LTO=OFF',
         '-DUSE_THIN_ARCHIVES=OFF',
     ]
@@ -299,6 +351,9 @@ def main():
         flags += [
             '-DCMAKE_C_COMPILER=clang-cl',
             '-DCMAKE_CXX_COMPILER=clang-cl',
+            *llvm_tool_flags(windows=True),
+            *release_flags(WINDOWS_SIZE_FLAGS),
+            '-DCMAKE_EXE_LINKER_FLAGS=/OPT:LLDLTOJOBS=2',
             '-DUSE_SYSTEM_MALLOC=OFF',
             '-DUSE_MIMALLOC=ON',
             '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL',
@@ -310,6 +365,9 @@ def main():
         flags += [
             '-DCMAKE_C_COMPILER=clang-21',
             '-DCMAKE_CXX_COMPILER=clang++-21',
+            *llvm_tool_flags(windows=False),
+            *release_flags(LINUX_SIZE_FLAGS),
+            '-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld-21 -Wl,--thinlto-jobs=2',
             '-DUSE_SYSTEM_MALLOC=ON',
             '-DUSE_MIMALLOC=OFF',
             '-DCMAKE_C_FLAGS=-DENABLE_AOT=0 -fPIC -ftls-model=global-dynamic',
@@ -338,7 +396,8 @@ def main():
         raise RuntimeError('JavaScriptCore API headers missing')
 
     exports = extract_c_api_exports(sdk / 'include/JavaScriptCore')
-    link_shared_library(windows, source, build, sdk, icu, exports, args.jobs)
+    binary = link_shared_library(windows, source, build, sdk, icu, exports, args.jobs)
+    sizes = check_size(binary)
 
     # No se copian las DLL de ICU.
     if windows and (icu / 'share/icu').is_dir():
@@ -369,6 +428,7 @@ def main():
         'runtime': '/MD' if windows else 'glibc, system ICU (Ubuntu 24.04)',
         'cmake_options': flags,
         'exported_symbols': len(exports),
+        'sizes': sizes,
     }, indent=2) + '\n', encoding='utf-8')
 
     if windows:

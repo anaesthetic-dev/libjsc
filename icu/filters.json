@@ -1,0 +1,21 @@
+{
+  "collationUCAData": "implicithan",
+  "localeFilter": {
+    "filterType": "language",
+    "includelist": [
+      "en", "es", "pt", "fr", "de", "it", "nl", "pl", "ru", "uk",
+      "tr", "ar", "he", "hi", "th", "vi", "id", "ms", "ja", "ko",
+      "zh", "sv", "da", "no", "nb", "fi", "cs", "hu", "ro", "el",
+      "bg", "hr", "sk", "sl", "sr", "ca", "fil"
+    ]
+  },
+  "featureFilters": {
+    "conversion_mappings": "exclude",
+    "translit": "exclude",
+    "rbnf_tree": "exclude",
+    "confusables": "exclude",
+    "stringprep": "exclude",
+    "unames": "exclude",
+    "brkitr_dictionaries": "exclude"
+  }
+}
