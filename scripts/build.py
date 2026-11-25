@@ -14,6 +14,9 @@ import tarfile
 from check_size import check_size
 
 
+WINDOWS_STACK_BASE = '0ef2dfd32038fb7e7b997883a4b67fc881c20fd9'
+WINDOWS_STACK_BACKPORT = 'a6331649580b67f2af8a827f0eb89f73422fea55'
+
 WINDOWS_SIZE_FLAGS = ('/O1', '/Os', '/Gy', '/Gw', '-flto=thin')
 LINUX_SIZE_FLAGS = ('-Os', '-ffunction-sections', '-fdata-sections', '-flto=thin')
 
@@ -94,6 +97,15 @@ def extract_c_api_exports(api_dir: Path) -> list[ApiExport]:
     if not exports:
         raise RuntimeError('No JS_EXPORT symbols found in API headers')
     return sorted(exports)
+
+
+def apply_windows_stack_backport(source: Path) -> None:
+    patch = Path(__file__).with_name('windows-stack-precommit.patch')
+    cmd = ['git', '-C', str(source), 'apply']
+    applied = subprocess.run([*cmd, '--reverse', '--check', '--', str(patch)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if applied.returncode != 0:
+        run(*cmd, '--', patch)
 
 
 def patch_js_global_context_release(source: Path) -> None:
@@ -317,6 +329,9 @@ def main():
         raise RuntimeError('WebKit requires LF line endings. Clone it with '
                            'git -c core.autocrlf=false clone https://github.com/oven-sh/WebKit.git webkit')
 
+    windows_stack_backport = windows and revision == WINDOWS_STACK_BASE
+    if windows_stack_backport:
+        apply_windows_stack_backport(source)
     patch_js_global_context_release(source)
     disable_extractor_lto(source, windows)
 
@@ -419,6 +434,7 @@ def main():
     (sdk / 'build-info.json').write_text(json.dumps({
         'repository': 'https://github.com/oven-sh/WebKit',
         'commit': revision,
+        'webkit_backports': [WINDOWS_STACK_BACKPORT] if windows_stack_backport else [],
         'platform': args.platform,
         'linkage': 'shared',
         'configuration': 'Release',

@@ -1,0 +1,102 @@
+From a6331649580b67f2af8a827f0eb89f73422fea55 Mon Sep 17 00:00:00 2001
+From: Ian Grunert <ian.grunert@gmail.com>
+Date: Thu, 19 Nov 2026 18:47:13 -0800
+Subject: [PATCH] [Win] VM::updateStackLimits cache committed pages
+ https://bugs.webkit.org/show_bug.cgi?id=331705
+
+Reviewed by Yusuke Suzuki.
+
+preCommitStackMemory() touched every page down to the soft stack limit each time the JSLock
+was acquired or released. Committed stack pages stay committed, so remember the lowest page
+touched on the WTF::Thread and only touch the pages below it. Improves Speedometer 3.1 by
+about 5% on Windows.
+
+* Source/JavaScriptCore/runtime/VM.cpp:
+(JSC::preCommitStackMemory):
+(JSC::VM::updateStackLimits):
+* Source/WTF/wtf/Threading.h:
+(WTF::Thread::lowestPreCommittedStackAddress const):
+(WTF::Thread::setLowestPreCommittedStackAddress):
+
+Canonical link: https://commits.webkit.org/327395@main
+
+Backport to oven-sh/WebKit 0ef2dfd32038fb7e7b997883a4b67fc881c20fd9.
+Preserve the VM-entry guard before committing the Windows stack.
+
+---
+diff --git a/Source/JavaScriptCore/runtime/VM.cpp b/Source/JavaScriptCore/runtime/VM.cpp
+index 06e402d..2ddd5cc 100644
+--- a/Source/JavaScriptCore/runtime/VM.cpp
++++ b/Source/JavaScriptCore/runtime/VM.cpp
+@@ -1591,13 +1591,24 @@ size_t VM::updateSoftReservedZoneSize(size_t softReservedZoneSize)
+ // By touching every page up to the stack limit with a dummy operation,
+ // we force the system to move the guard page, and commit memory.
+ 
+-static void preCommitStackMemory(void* stackLimit)
++static void preCommitStackMemory(Thread& thread, void* stackLimit)
+ {
++    // Stack pages stay committed, so only touch the pages below the lowest one touched so far.
++    char* lowestPreCommittedAddress = static_cast<char*>(thread.lowestPreCommittedStackAddress());
++
+     const int pageSize = 4096;
+-    for (volatile char* p = reinterpret_cast<char*>(&stackLimit); p > stackLimit; p -= pageSize) {
++    char* start = reinterpret_cast<char*>(&stackLimit);
++    if (lowestPreCommittedAddress && lowestPreCommittedAddress < start)
++        start = lowestPreCommittedAddress;
++    if (start <= stackLimit)
++        return;
++
++    volatile char* p = start;
++    for (; p > stackLimit; p -= pageSize) {
+         char ch = *p;
+         *p = ch;
+     }
++    thread.setLowestPreCommittedStackAddress(const_cast<char*>(p + pageSize));
+ }
+ #endif
+ 
+@@ -1605,7 +1616,8 @@ void VM::updateStackLimits()
+ {
+     void* lastSoftStackLimit = traps().softStackLimit();
+ 
+-    const StackBounds& stack = Thread::currentSingleton().stack();
++    Thread& thread = Thread::currentSingleton();
++    const StackBounds& stack = thread.stack();
+     size_t reservedZoneSize = Options::reservedZoneSize();
+     // We should have already ensured that Options::reservedZoneSize() >= minimumReserveZoneSize at
+     // options initialization time, and the option value should not have been changed thereafter.
+@@ -1642,7 +1654,7 @@ void VM::updateStackLimits()
+         // which raises EXCEPTION_STACK_OVERFLOW on commit-constrained hosts when the reserve
+         // is large.
+         if (m_stackPointerAtVMEntry)
+-            preCommitStackMemory(newSoftStackLimit);
++            preCommitStackMemory(thread, newSoftStackLimit);
+ #endif
+     }
+ }
+diff --git a/Source/WTF/wtf/Threading.h b/Source/WTF/wtf/Threading.h
+index 4a344b2..cf0738f 100644
+--- a/Source/WTF/wtf/Threading.h
++++ b/Source/WTF/wtf/Threading.h
+@@ -299,6 +299,11 @@ public:
+         m_savedLastStackTop = lastStackTop;
+     }
+ 
++#if OS(WINDOWS)
++    void* lowestPreCommittedStackAddress() const { return m_lowestPreCommittedStackAddress; }
++    void setLowestPreCommittedStackAddress(void* address) { m_lowestPreCommittedStackAddress = address; }
++#endif
++
+ #if OS(DARWIN)
+     mach_port_t machThread() { return m_platformThread; }
+ #endif
+@@ -449,6 +454,9 @@ protected:
+ #endif
+     void* m_savedStackPointerAtVMEntry { nullptr };
+     void* m_savedLastStackTop;
++#if OS(WINDOWS)
++    void* m_lowestPreCommittedStackAddress { nullptr };
++#endif
+ public:
+     void* m_apiData { nullptr };
+     RefPtr<ClientData> m_clientData { nullptr };
